@@ -23,6 +23,11 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+try:
+    from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
+except ImportError:
+    NaiveStreamingDetokenizer = None
+
 from jsonschema import validate, ValidationError
 
 from .openai_models import FunctionCall, ResponseFormat, ToolCall, ToolDefinition
@@ -673,6 +678,83 @@ def parse_tool_calls_with_thinking_fallback(
         tools,
     )
     return result.cleaned_text, result.tool_calls
+
+
+
+class StreamingToolCallParser:
+    """Best-effort streaming parser for native tool-call markup.
+
+    This parser is intentionally conservative: it only emits a structured
+    tool-call stream after the complete native tool-call envelope has been
+    generated and parsed successfully, but it splits the OpenAI
+    ``function.arguments`` JSON string into many SSE deltas. That preserves
+    correctness while giving clients visible tool-input progress instead of a
+    single final ``tool_calls`` chunk.
+    """
+
+    def __init__(self, tokenizer: Any, tools: Optional[List] = None):
+        self._tokenizer = tokenizer
+        self._tools = tools
+        self._buffer = ""
+        self._emitted_spans: List[Tuple[int, int]] = []
+        self._call_index = 0
+
+    def feed(self, text: str) -> List[ToolCall]:
+        if not text:
+            return []
+        self._buffer += text
+        return self._extract_new_calls()
+
+    def finish(self) -> List[ToolCall]:
+        return self._extract_new_calls()
+
+    def _span_already_emitted(self, span: Tuple[int, int]) -> bool:
+        start, end = span
+        for old_start, old_end in self._emitted_spans:
+            if start >= old_start and end <= old_end:
+                return True
+        return False
+
+    def _extract_new_calls(self) -> List[ToolCall]:
+        spans: List[Tuple[int, int, str]] = []
+        text = self._buffer
+
+        marker = getattr(self._tokenizer, "tool_call_start", None) or ""
+        marker_end = getattr(self._tokenizer, "tool_call_end", None) or ""
+        marker_pairs: List[Tuple[str, str]] = []
+        if marker and marker_end:
+            marker_pairs.append((marker, marker_end))
+        marker_pairs.append(("<tool_call>", "</tool_call>"))
+
+        for start_marker, end_marker in marker_pairs:
+            pattern = re.escape(start_marker) + r".*?" + re.escape(end_marker)
+            for match in re.finditer(pattern, text, re.DOTALL):
+                spans.append((match.start(), match.end(), match.group(0)))
+
+        ns_re = re.compile(r"<([A-Za-z_][\w.-]*):tool_call>.*?</\1:tool_call>", re.DOTALL)
+        for match in ns_re.finditer(text):
+            spans.append((match.start(), match.end(), match.group(0)))
+
+        spans.sort(key=lambda item: (item[0], item[1]))
+
+        calls: List[ToolCall] = []
+        for start, end, raw in spans:
+            span = (start, end)
+            if self._span_already_emitted(span):
+                continue
+            _, parsed = parse_tool_calls(raw, self._tokenizer, self._tools)
+            if parsed:
+                self._emitted_spans.append(span)
+                calls.extend(parsed)
+        return calls
+
+
+def iter_tool_call_argument_chunks(arguments: str, chunk_size: int = 8):
+    """Yield small argument fragments for OpenAI-compatible tool deltas."""
+    if arguments is None:
+        return
+    for i in range(0, len(arguments), chunk_size):
+        yield arguments[i : i + chunk_size]
 
 
 class ToolCallStreamFilter:

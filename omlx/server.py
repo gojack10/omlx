@@ -142,6 +142,8 @@ from .api.responses_utils import (
 )
 from .api.tool_calling import (
     ToolCallStreamFilter,
+    StreamingToolCallParser,
+    iter_tool_call_argument_chunks,
     build_json_system_prompt,
     convert_tools_for_template,
     enrich_tool_params_for_gemma4,
@@ -2660,6 +2662,8 @@ async def stream_chat_completion(
     # clients do not see raw envelopes/tags in assistant content deltas.
     tool_filter = None
     thinking_filter = None
+    stream_tool_parser = StreamingToolCallParser(engine.tokenizer, kwargs.get("tools")) if has_tools else None
+    streamed_tool_calls = []
     stream_content = True
     if has_tools:
         _content_filter = ToolCallStreamFilter(engine.tokenizer)
@@ -2676,6 +2680,47 @@ async def stream_chat_completion(
             last_output = output
             if output.new_text:
                 accumulated_text += output.new_text
+
+                if stream_tool_parser:
+                    new_streamed_calls = stream_tool_parser.feed(output.new_text)
+                    if not new_streamed_calls and output.finished:
+                        new_streamed_calls = stream_tool_parser.finish()
+                    for tc in new_streamed_calls:
+                        streamed_tool_calls.append(tc)
+                        tc_index = len(streamed_tool_calls) - 1
+                        tc_chunk = ChatCompletionChunk(
+                            id=response_id,
+                            model=request.model,
+                            choices=[ChatCompletionChunkChoice(
+                                delta=ChatCompletionChunkDelta(
+                                    tool_calls=[{
+                                        "index": tc_index,
+                                        "id": tc.id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": tc.function.name,
+                                            "arguments": "",
+                                        },
+                                    }],
+                                ),
+                            )],
+                        )
+                        yield f"data: {tc_chunk.model_dump_json(exclude_none=True)}\n\n"
+                        for arg_delta in iter_tool_call_argument_chunks(tc.function.arguments):
+                            tc_chunk = ChatCompletionChunk(
+                                id=response_id,
+                                model=request.model,
+                                choices=[ChatCompletionChunkChoice(
+                                    delta=ChatCompletionChunkDelta(
+                                        tool_calls=[{
+                                            "index": tc_index,
+                                            "function": {"arguments": arg_delta},
+                                        }],
+                                    ),
+                                )],
+                            )
+                            yield f"data: {tc_chunk.model_dump_json(exclude_none=True)}\n\n"
+                            await asyncio.sleep(0.02)
 
             if stream_content and output.new_text:
                 thinking_delta, content_delta = thinking_parser.feed(output.new_text)
@@ -2775,9 +2820,11 @@ async def stream_chat_completion(
                 yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
 
     # Parse tool calls from accumulated text
-    tool_calls = None
+    tool_calls = streamed_tool_calls or None
     cleaned_text = accumulated_text
-    if last_output and last_output.tool_calls:
+    if tool_calls:
+        pass
+    elif last_output and last_output.tool_calls:
         # Harmony model — tool_calls already extracted by parser
         from .api.openai_models import ToolCall, FunctionCall
         tool_calls = [
@@ -2850,8 +2897,47 @@ async def stream_chat_completion(
                 except (json.JSONDecodeError, AttributeError):
                     pass
 
-    # Emit tool call chunks if found
-    if tool_calls:
+    # If we could only parse the tool call after generation completed, still
+    # emit it as OpenAI-style argument deltas instead of one monolithic chunk.
+    if tool_calls and not streamed_tool_calls:
+        streamed_tool_calls = list(tool_calls)
+        for i, tc in enumerate(streamed_tool_calls):
+            tc_chunk = ChatCompletionChunk(
+                id=response_id,
+                model=request.model,
+                choices=[ChatCompletionChunkChoice(
+                    delta=ChatCompletionChunkDelta(
+                        tool_calls=[{
+                            "index": i,
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": "",
+                            },
+                        }],
+                    ),
+                )],
+            )
+            yield f"data: {tc_chunk.model_dump_json(exclude_none=True)}\n\n"
+            for arg_delta in iter_tool_call_argument_chunks(tc.function.arguments):
+                tc_chunk = ChatCompletionChunk(
+                    id=response_id,
+                    model=request.model,
+                    choices=[ChatCompletionChunkChoice(
+                        delta=ChatCompletionChunkDelta(
+                            tool_calls=[{
+                                "index": i,
+                                "function": {"arguments": arg_delta},
+                            }],
+                        ),
+                    )],
+                )
+                yield f"data: {tc_chunk.model_dump_json(exclude_none=True)}\n\n"
+                await asyncio.sleep(0.02)
+
+    # Legacy monolithic emission disabled once calls have been streamed above.
+    if False and tool_calls and not streamed_tool_calls:
         for i, tc in enumerate(tool_calls):
             tc_chunk = ChatCompletionChunk(
                 id=response_id,
