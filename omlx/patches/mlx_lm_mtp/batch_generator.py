@@ -208,7 +208,13 @@ def _model_has_mtp_module(model: Any) -> bool:
     ``mtp_forward`` call would AttributeError, so we gate eligibility on
     the actual module's presence.
     """
-    inner = getattr(model, "language_model", model)
+    inner = getattr(model, "language_model", None)
+    if inner is None:
+        # oMLX's VLMModelAdapter wraps mlx-vlm models as ``_language_model``
+        # so BatchGenerator can decode through a text-only interface. Native
+        # MTP runtime patches attach the head to that wrapped language model,
+        # not to the adapter itself.
+        inner = getattr(model, "_language_model", model)
     return hasattr(inner, "mtp") and getattr(inner, "mtp", None) is not None
 
 
