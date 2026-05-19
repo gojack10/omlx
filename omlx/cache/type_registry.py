@@ -64,6 +64,13 @@ class CacheTypeRegistry:
         # patches/deepseek_v4/cache_handlers.py and register on patch apply.
         "PoolingCache": CacheType.POOLING_CACHE,
         "BatchPoolingCache": CacheType.BATCH_POOLING_CACHE,
+        # DeepSeek V4 per-layer KV cache (sliding window + compressed pool).
+        # Handler lives in patches/deepseek_v4/cache_handlers.py and is
+        # registered on patch apply (step 8 of apply_deepseek_v4_patch).
+        "V4Cache": CacheType.V4_CACHE,
+        # Batched variant for the omlx BatchedEngine path; handler also
+        # lives in patches/deepseek_v4/cache_handlers.py.
+        "BatchV4Cache": CacheType.BATCH_V4_CACHE,
     }
 
     # Default handler instance

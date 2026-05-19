@@ -103,14 +103,25 @@ def _register_module(qualname: str, file_name: str) -> None:
 
 
 def _register_cache_handlers() -> None:
-    """Register PoolingCache / BatchPoolingCache handlers in omlx CacheTypeRegistry."""
+    """Register PoolingCache / BatchPoolingCache / V4Cache / BatchV4Cache
+    handlers in omlx CacheTypeRegistry."""
     from omlx.cache.type_registry import CacheTypeRegistry
 
-    from .cache_handlers import BatchPoolingCacheHandler, PoolingCacheHandler
+    from .cache_handlers import (
+        BatchPoolingCacheHandler,
+        BatchV4CacheHandler,
+        PoolingCacheHandler,
+        V4CacheHandler,
+    )
 
     CacheTypeRegistry.register(PoolingCacheHandler())
     CacheTypeRegistry.register(BatchPoolingCacheHandler())
-    logger.info("PoolingCacheHandler + BatchPoolingCacheHandler registered")
+    CacheTypeRegistry.register(V4CacheHandler())
+    CacheTypeRegistry.register(BatchV4CacheHandler())
+    logger.info(
+        "PoolingCacheHandler + BatchPoolingCacheHandler + V4CacheHandler "
+        "+ BatchV4CacheHandler registered"
+    )
 
 
 def _register_model_type_aliases() -> None:

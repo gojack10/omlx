@@ -38,6 +38,8 @@ class CacheType(Enum):
     CACHE_LIST = "CacheList"
     POOLING_CACHE = "PoolingCache"
     BATCH_POOLING_CACHE = "BatchPoolingCache"
+    V4_CACHE = "V4Cache"
+    BATCH_V4_CACHE = "BatchV4Cache"
 
 
 @dataclass

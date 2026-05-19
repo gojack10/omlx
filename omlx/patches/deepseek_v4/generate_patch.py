@@ -49,6 +49,12 @@ def apply_generate_patch() -> bool:
 
     _gen = importlib.import_module("mlx_lm.generate")
     from mlx_lm.models.cache import BatchPoolingCache, PoolingCache
+    # These two come from the deepseek_v4 module that
+    # ``_register_module('mlx_lm.models.deepseek_v4', ...)`` installs into
+    # sys.modules earlier in apply_deepseek_v4_patch. Importing them lazily
+    # here (rather than at module top-level) makes the patch-order dependency
+    # explicit.
+    from mlx_lm.models.deepseek_v4 import BatchV4Cache, V4Cache
 
     def _patched_make_cache(model, left_padding, max_kv_size):
         """Convert a list of regular caches into their corresponding
@@ -63,6 +69,8 @@ def apply_generate_patch() -> bool:
                 return c
             elif isinstance(c, PoolingCache):
                 return BatchPoolingCache(c.ratio, left_padding)
+            elif isinstance(c, V4Cache):
+                return BatchV4Cache.from_v4_cache(c, left_padding)
             elif isinstance(c, RotatingKVCache):
                 if c.keep > 0:
                     raise ValueError(

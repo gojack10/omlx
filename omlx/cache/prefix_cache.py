@@ -1979,6 +1979,9 @@ class BlockAwarePrefixCache(CacheManager):
                         "PoolingCache",
                         "ArraysCache",
                         "BatchPoolingCache",
+                        "BatchRotatingKVCache",
+                        "V4Cache",
+                        "BatchV4Cache",
                     }
 
                     def _is_non_sliceable_sub_class(class_name: str) -> bool:
