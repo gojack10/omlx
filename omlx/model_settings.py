@@ -91,7 +91,7 @@ class ModelSettings:
             drafter (mlx-vlm 191d7c8+). Target = Gemma4 VLM body, drafter must be a
             "gemma4_assistant" model.
         vlm_mtp_draft_model: Path/repo of the assistant drafter (e.g. "gemma-4-26B-A4B-it-assistant").
-        vlm_mtp_draft_block_size: Tokens drafted per round (None = mlx-vlm default).
+        vlm_mtp_draft_block_size: Tokens drafted per round (default 2).
         is_pinned: Keep model loaded in memory.
         is_default: Use this model when no model is specified.
         display_name: Human-readable name for UI display.
@@ -170,7 +170,7 @@ class ModelSettings:
     # bypasses mlx-lm BatchGenerator at decode time.
     vlm_mtp_enabled: bool = False
     vlm_mtp_draft_model: Optional[str] = None  # Path / model id of the assistant drafter
-    vlm_mtp_draft_block_size: Optional[int] = None  # Tokens per draft round (None = mlx-vlm default)
+    vlm_mtp_draft_block_size: Optional[int] = 2  # Tokens per draft round
 
     # Model management flags
     is_pinned: bool = False
