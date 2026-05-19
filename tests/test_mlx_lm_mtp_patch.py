@@ -666,6 +666,7 @@ class TestBatchGeneratorDispatch:
         )
 
     def test_is_mtp_eligible_requires_mtp_forward_and_solo_batch(self):
+
         from omlx.patches.mlx_lm_mtp import (
             is_mtp_active,
             set_mtp_active,
@@ -673,6 +674,8 @@ class TestBatchGeneratorDispatch:
         from omlx.patches.mlx_lm_mtp import batch_generator
 
         _is_mtp_eligible = batch_generator._is_mtp_eligible
+
+        set_mtp_active(True)
 
         class _NonMtpModel:
             pass
@@ -691,6 +694,16 @@ class TestBatchGeneratorDispatch:
             def __init__(self, decode_enabled=True):
                 self.mtp = object()  # placeholder for an actual MTPModule
                 self._omlx_mtp_decode_enabled = decode_enabled
+
+            def mtp_forward(self, *_):
+                pass
+
+        class _VlmAdapterMtpModel:
+            """oMLX VLMModelAdapter keeps the real language model under
+            _language_model; the MTP head is attached there."""
+
+            def __init__(self):
+                self._language_model = _MtpModel()
 
             def mtp_forward(self, *_):
                 pass
@@ -720,6 +733,8 @@ class TestBatchGeneratorDispatch:
             # Has method, head, and per-instance marker + batch=1. The current
             # process-wide construction flag no longer controls decode.
             assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[1])) is True
+            # VLM adapter wrapper with head on _language_model also triggers.
+            assert _is_mtp_eligible(_GenBatch(_VlmAdapterMtpModel(), uids=[1])) is True
             # MTP model with batch=2 falls back to standard step.
             assert _is_mtp_eligible(_GenBatch(_MtpModel(), uids=[1, 2])) is False
             # Empty batch never triggers.
@@ -737,6 +752,7 @@ class TestBatchGeneratorDispatch:
             is_mtp_active,
             set_mtp_active,
         )
+
         from omlx.patches.mlx_lm_mtp import batch_generator
 
         class _MtpModel:
