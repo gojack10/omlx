@@ -252,7 +252,9 @@ def maybe_apply_pre_load_patches(
             apply_mlx_lm_mtp_patch,
             set_mtp_active,
         )
+        from ..patches.mtplx_sidecar import apply_mtplx_sidecar_patch
 
+        apply_mtplx_sidecar_patch()
         if apply_mlx_lm_mtp_patch():
             set_mtp_active(mtp_enabled)
             if mtp_enabled:
