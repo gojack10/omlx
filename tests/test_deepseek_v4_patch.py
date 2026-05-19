@@ -368,21 +368,20 @@ class TestDSMLToolParser:
 class TestChatTemplateV4:
     """chat_template_v4 — DSML system prompt + tool_calls render."""
 
-    def test_outer_marker_uses_tool_calls_not_function_calls(self, applied_patch):
+    def test_outer_marker_is_tool_calls(self, applied_patch):
         from omlx.patches.deepseek_v4 import chat_template_v4 as ct
 
-        # vllm's DeepSeekV4ToolParser overrides only the outer marker
-        # name (tool_calls vs V3.2's function_calls). Verify our copy
-        # made that one edit.
+        # Vendored encoding_dsv4 names the outer block ``tool_calls``.
+        # The historical V3.2 ``function_calls`` marker must not leak.
+        assert ct.tool_calls_block_name == "tool_calls"
         assert "function_calls" not in ct.tool_calls_template
-        assert "tool_calls" in ct.tool_calls_template
-        assert "function_calls" not in ct.TOOLS_SYSTEM_TEMPLATE
+        assert "function_calls" not in ct.TOOLS_TEMPLATE
 
-    def test_inner_grammar_unchanged_from_v32(self, applied_patch):
+    def test_inner_grammar_is_invoke_parameter(self, applied_patch):
         from omlx.patches.deepseek_v4 import chat_template_v4 as ct
 
-        # Inner markers must still be invoke / parameter — V4 reuses V3.2's
-        # invoke/parameter grammar.
+        # Inner markers are invoke / parameter — bit-identical between
+        # V3.2 and the V4 publisher spec.
         assert "invoke" in ct.tool_call_template
         assert "parameter" in ct.encode_arguments_to_dsml(
             {"name": "x", "arguments": '{"k": "v"}'}
@@ -398,8 +397,12 @@ class TestChatTemplateV4:
         invoke = ct.tool_call_template.format(
             dsml_token=ct.dsml_token, name="f", arguments=encoded_args
         )
+        # The vendored ``tool_calls_template`` is parametric over the
+        # block name; the omlx adapter always uses ``tool_calls``.
         block = ct.tool_calls_template.format(
-            dsml_token=ct.dsml_token, tool_calls=invoke
+            dsml_token=ct.dsml_token,
+            tc_block_name=ct.tool_calls_block_name,
+            tool_calls=invoke,
         )
         # Strip the outer markers as TokenizerWrapper would.
         inner = (
@@ -412,12 +415,12 @@ class TestChatTemplateV4:
         """User-only message + tools must still emit the DSML tools block.
 
         Regression guard for the case where a Claude Code or OpenAI client
-        passes ``tools`` without a system message. ``render_message`` only
-        injects tools on system / developer roles, so ``encode_messages``
-        synthesises an empty system message up front when the first
-        message is a plain user. Without this fix the rendered prompt
-        omits the ``<functions>`` schema entirely and the model never
-        emits a tool_calls block.
+        passes ``tools`` without a system message. The publisher encoding
+        only renders the tools block on system / developer roles, so the
+        adapter synthesises an empty system message up front when the
+        first message is a plain user. Without this the rendered prompt
+        omits the tools schema entirely and the model never emits a
+        tool_calls block.
         """
         from omlx.patches.deepseek_v4 import chat_template_v4 as ct
 
@@ -440,7 +443,10 @@ class TestChatTemplateV4:
             tools=tools,
             add_generation_prompt=True,
         )
-        assert "<functions>" in prompt
+        # Publisher spec renders the tools section under ``## Tools`` with
+        # ``### Available Tool Schemas`` framing — not ``<functions>``.
+        assert "## Tools" in prompt
+        assert "### Available Tool Schemas" in prompt
         assert "get_weather" in prompt
         assert ct.dsml_token in prompt
 
@@ -475,11 +481,12 @@ class TestChatTemplateV4:
         )
         assert "You are a helpful assistant." in prompt
         # Only one tools block — no double-injection from synthetic prepend.
-        assert prompt.count("<functions>") == 1
+        assert prompt.count("## Tools") == 1
+        assert prompt.count("### Available Tool Schemas") == 1
 
     def test_user_only_no_tools_no_prepend(self, applied_patch):
         """No tools → no synthetic system. Plain user-only request renders
-        with just the BOS + user wrapper, matching V3.2 baseline."""
+        with just the BOS + user wrapper."""
         from omlx.patches.deepseek_v4 import chat_template_v4 as ct
 
         prompt = ct.apply_chat_template(
@@ -488,24 +495,43 @@ class TestChatTemplateV4:
         )
         assert "<functions>" not in prompt
         assert "## Tools" not in prompt
+        assert "### Available Tool Schemas" not in prompt
 
-    def test_encode_arguments_accepts_dict(self, applied_patch):
+    def test_dict_arguments_normalized_at_adapter_boundary(self, applied_patch):
         """Anthropic /v1/messages history stores tool_call arguments as
-        a dict (anthropic_utils.py decodes the input before saving).
-        encode_arguments_to_dsml must accept that shape — not just the
-        OpenAI JSON-string convention — so multi-turn renders don't
-        raise TypeError when the assistant history is from Claude Code.
+        a dict (anthropic_utils.py decodes the input before saving). The
+        vendored ``encode_arguments_to_dsml`` only knows the OpenAI
+        JSON-string convention, so the adapter normalises dict→JSON-string
+        at the boundary before delegating. Without this, multi-turn
+        renders from Claude Code would emit a degenerate single
+        ``arguments`` parameter instead of one parameter per key.
         """
         from omlx.patches.deepseek_v4 import chat_template_v4 as ct
 
-        encoded = ct.encode_arguments_to_dsml(
-            {"name": "f", "arguments": {"location": "Seoul", "n": 3}}
+        prompt = ct.apply_chat_template(
+            [
+                {"role": "user", "content": "Weather?"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "f",
+                                "arguments": {"location": "Seoul", "n": 3},
+                            },
+                        }
+                    ],
+                },
+            ],
+            add_generation_prompt=False,
         )
-        assert 'name="location"' in encoded and "Seoul" in encoded
-        assert 'name="n"' in encoded and ">3<" in encoded
-        # string="true" for string params, "false" for non-string.
-        assert 'string="true"' in encoded
-        assert 'string="false"' in encoded
+        assert 'name="location"' in prompt and "Seoul" in prompt
+        assert 'name="n"' in prompt and ">3<" in prompt
+        assert 'string="true"' in prompt
+        assert 'string="false"' in prompt
 
     def test_assistant_tool_call_dict_arguments_round_trip(self, applied_patch):
         """End-to-end multi-turn: assistant message history contains a

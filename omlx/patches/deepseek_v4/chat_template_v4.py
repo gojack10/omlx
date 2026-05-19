@@ -1,389 +1,155 @@
 # Copyright © 2025 Apple Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""DeepSeek V4 DSML chat template (derived from mlx-lm deepseek_v32).
+"""mlx-lm-facing adapter for DeepSeek V4's DSML chat template.
 
-This file is a near-verbatim copy of
-``mlx_lm/chat_templates/deepseek_v32.py`` (Apple Inc., Apache 2.0). The
-only edit is the outer DSML marker name: V3.2 wraps tool calls in
-``<｜DSML｜function_calls>...</｜DSML｜function_calls>`` while V4 uses
-``<｜DSML｜tool_calls>...</｜DSML｜tool_calls>`` (per vllm's
-``DeepSeekV4ToolParser`` which subclasses ``DeepSeekV32ToolParser``
-overriding only those two tokens). The inner ``<｜DSML｜invoke>`` /
-``<｜DSML｜parameter>`` grammar is identical between V3.2 and V4.
+The encoding itself lives in the sibling module ``encoding_dsv4`` — a
+verbatim vendor copy of the reference implementation DeepSeek ships
+alongside the model weights on HuggingFace. We re-export the encoding
+module's symbols so callers that imported from ``chat_template_v4``
+keep working, and we add a thin ``apply_chat_template`` that bridges
+mlx-lm's call signature to ``encoding_dsv4.encode_messages``.
 
-omlx registers this module as ``mlx_lm.chat_templates.deepseek_v4`` so
-mlx-lm's tokenizer_config ``chat_template_type`` lookup picks it up
-transparently.
+Historical note. An earlier version of this file was a near-verbatim
+copy of mlx-lm's V3.2 chat template with only the outer DSML marker
+name renamed (function_calls → tool_calls), citing vllm's
+``DeepSeekV4ToolParser`` as the authority. That authority only
+specified what to *parse* — it said nothing about the prompt-side
+framing the model was trained on. The shipped ``encoding_dsv4.py``
+diverges from the V3.2 derivation on terminology ("tools" not
+"functions"), schema wrapping (bare under ``### Available Tool
+Schemas`` not inside ``<functions>``), tool-output marker
+(``<tool_result>`` not ``<function_results><result>``), thinking-mode
+imperative phrasing, and several other places. omlx now defers to the
+publisher's spec wholesale.
 """
 
-import copy
+from __future__ import annotations
+
 import json
-import re
-from inspect import isfunction
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional
 
-from transformers.utils.chat_template_utils import get_json_schema
-
-TOOLS_SYSTEM_TEMPLATE = """## Tools
-
-You have access to a set of tools you can use to answer the user's question.
-You can invoke functions by writing a "<{dsml_token}tool_calls>" block like the following as part of your reply to the user:
-<{dsml_token}tool_calls>
-<{dsml_token}invoke name="$FUNCTION_NAME">
-<{dsml_token}parameter name="$PARAMETER_NAME" string="true|false">$PARAMETER_VALUE</{dsml_token}parameter>
-...
-</{dsml_token}invoke>
-<{dsml_token}invoke name="$FUNCTION_NAME2">
-...
-</{dsml_token}invoke>
-</{dsml_token}tool_calls>
-
-String and scalar parameters should be specified as is without any escaping or quotes, while lists and objects should use JSON format. The "string" attribute should be set to "true" for string type parameters and "false" for other types (numbers, booleans, arrays, objects).
-
-If the thinking_mode is enabled, then after function results you should strongly consider outputting a thinking block. Here is an example:
-
-<{dsml_token}tool_calls>
-...
-</{dsml_token}tool_calls>
-
-<function_results>
-...
-</function_results>
-
-{thinking_start_token}...thinking about results{thinking_end_token}
-
-Here are the functions available in JSONSchema format:
-<functions>
-{tool_schemas}
-</functions>
-"""
-
-bos_token: str = "<｜begin▁of▁sentence｜>"
-eos_token: str = "<｜end▁of▁sentence｜>"
-thinking_start_token: str = "<think>"
-thinking_end_token: str = "</think>"
-dsml_token: str = "｜DSML｜"
-system_msg_template: str = "{content}"
-user_msg_template: str = "<｜User｜>{content}<｜Assistant｜>"
-assistant_msg_template: str = "{reasoning}{content}{tool_calls}<｜end▁of▁sentence｜>"
-thinking_template = "{reasoning_content}"
-
-response_format_template: str = (
-    "## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n{schema}"
-)
-tool_call_template: str = (
-    '<{dsml_token}invoke name="{name}">\n{arguments}\n</{dsml_token}invoke>'
-)
-tool_calls_template = (
-    "<{dsml_token}tool_calls>\n{tool_calls}\n</{dsml_token}tool_calls>"
+from . import encoding_dsv4 as _enc
+# Re-export the encoding module surface so existing callers keep their
+# imports. Names follow the upstream module verbatim; the adapter
+# layer only adds ``apply_chat_template``.
+from .encoding_dsv4 import (  # noqa: F401
+    ASSISTANT_SP_TOKEN,
+    DS_TASK_SP_TOKENS,
+    LATEST_REMINDER_SP_TOKEN,
+    REASONING_EFFORT_MAX,
+    TOOLS_TEMPLATE,
+    USER_SP_TOKEN,
+    VALID_TASKS,
+    assistant_msg_template,
+    assistant_msg_wo_eos_template,
+    bos_token,
+    decode_dsml_to_arguments,
+    dsml_token,
+    encode_arguments_to_dsml,
+    encode_messages,
+    eos_token,
+    find_last_user_index,
+    merge_tool_messages,
+    parse_message_from_completion_text,
+    parse_tool_calls,
+    render_message,
+    render_tools,
+    response_format_template,
+    sort_tool_results_by_call_order,
+    system_msg_template,
+    thinking_end_token,
+    thinking_start_token,
+    thinking_template,
+    to_json,
+    tool_call_template,
+    tool_calls_block_name,
+    tool_calls_from_openai_format,
+    tool_calls_template,
+    tool_calls_to_openai_format,
+    tool_output_template,
+    tools_from_openai_format,
+    user_msg_template,
 )
 
-tool_output_template: str = "\n<result>{content}</result>"
+
+_ENCODE_ACCEPTED_KWARGS = {
+    "thinking_mode",
+    "context",
+    "drop_thinking",
+    "add_default_bos_token",
+    "reasoning_effort",
+}
 
 
-def to_json(value: Any) -> str:
-    try:
-        return json.dumps(value, ensure_ascii=False)
-    except:
-        return json.dumps(value, ensure_ascii=True)
-
-
-def tools_from_openai_format(tools):
-    def normalize_tool(tool):
-        if isfunction(tool):
-            return get_json_schema(tool)
-        return tool["function"]
-
-    return [normalize_tool(tool) for tool in tools]
-
-
-def tool_calls_from_openai_format(tool_calls):
-    return [
-        {
-            "name": tool_call["function"]["name"],
-            "arguments": tool_call["function"]["arguments"],
-        }
-        for tool_call in tool_calls
-    ]
-
-
-def encode_arguments_to_dsml(tool_call: Dict[str, str]) -> str:
-    p_dsml_template = """<{dsml_token}parameter name="{key}" string="{is_str}">{value}</{dsml_token}parameter>"""
-    P_dsml_strs = []
-
-    # OpenAI tool_calls store arguments as a JSON string; the omlx
-    # Anthropic adapter (api/anthropic_utils.py:198) decodes ``input``
-    # into a dict before storing it on assistant messages. Accept both
-    # so multi-turn conversations whose history was authored from
-    # either side render without raising.
-    raw_args = tool_call["arguments"]
-    if isinstance(raw_args, str):
-        arguments = json.loads(raw_args)
-    elif isinstance(raw_args, dict):
-        arguments = raw_args
-    else:
-        raise TypeError(
-            f"tool_call['arguments'] must be str or dict, got "
-            f"{type(raw_args).__name__}"
-        )
-
-    for k, v in arguments.items():
-        p_dsml_str = p_dsml_template.format(
-            dsml_token=dsml_token,
-            key=k,
-            is_str="true" if isinstance(v, str) else "false",
-            value=v if isinstance(v, str) else to_json(v),
-        )
-
-        P_dsml_strs.append(p_dsml_str)
-
-    return "\n".join(P_dsml_strs)
-
-
-def decode_dsml_to_arguments(
-    tool_name: str, tool_args: Dict[str, Tuple[str, str]]
-) -> Dict[str, str]:
-    def _decode_value(key: str, value: str, string: str):
-        if string == "true":
-            value = to_json(value)
-        return f"{to_json(key)}: {value}"
-
-    tool_args_json = (
-        "{"
-        + ", ".join(
-            [_decode_value(k, v, string=is_str) for k, (v, is_str) in tool_args.items()]
-        )
-        + "}"
-    )
-    return dict(name=tool_name, arguments=tool_args_json)
-
-
-def render_tools(tools: List[Dict[str, Union[str, Dict[str, Any]]]]) -> str:
-    tools_json = [to_json(t) for t in tools]
-
-    return TOOLS_SYSTEM_TEMPLATE.format(
-        tool_schemas="\n".join(tools_json),
-        dsml_token=dsml_token,
-        thinking_start_token=thinking_start_token,
-        thinking_end_token=thinking_end_token,
-    )
-
-
-def find_last_user_index(messages: List[Dict[str, Any]]) -> int:
-    last_user_index = -1
-    for idx in range(len(messages) - 1, -1, -1):
-        if messages[idx].get("role") in ["user", "developer"]:
-            last_user_index = idx
-            break
-    return last_user_index
-
-
-def render_message(
-    index: int,
+def _normalize_tool_call_arguments(
     messages: List[Dict[str, Any]],
-    thinking_mode: str,
-    tools: Any = None,
-) -> str:
-    assert 0 <= index < len(messages)
-    assert thinking_mode in [
-        "chat",
-        "thinking",
-    ], f"Invalid thinking_mode `{thinking_mode}`"
-
-    prompt = ""
-    msg = messages[index]
-    last_user_idx = find_last_user_index(messages)
-
-    role = msg.get("role")
-    content = msg.get("content")
-    tools = tools or msg.get("tools")
-    response_format = msg.get("response_format")
-    tool_calls = msg.get("tool_calls")
-    reasoning_content = msg.get("reasoning_content")
-
-    if tool_calls:
-        tool_calls = tool_calls_from_openai_format(tool_calls)
-
-    if role == "system":
-        prompt += system_msg_template.format(content=content or "")
-        if tools:
-            prompt += "\n\n" + render_tools(tools_from_openai_format(tools))
-
-        if response_format:
-            prompt += "\n\n" + response_format_template.format(
-                schema=to_json(response_format)
-            )
-
-    elif role == "developer":
-        assert content, f"Invalid message for role `{role}`: {msg}"
-        content_developer = ""
-        if tools:
-            content_developer += "\n\n" + render_tools(tools_from_openai_format(tools))
-
-        if response_format:
-            content_developer += "\n\n" + response_format_template.format(
-                schema=to_json(response_format)
-            )
-
-        content_developer += "\n\n# The user's message is: {}".format(content)
-
-        prompt += user_msg_template.format(content=content_developer)
-        if index == last_user_idx and thinking_mode == "thinking":
-            prompt += thinking_start_token
-        else:
-            prompt += thinking_end_token
-
-    elif role == "user":
-        prompt += user_msg_template.format(content=content)
-
-        if index == last_user_idx and thinking_mode == "thinking":
-            prompt += thinking_start_token
-        else:
-            prompt += thinking_end_token
-
-    elif role == "tool":
-        prev_assistant_idx = index - 1
-        assistant_msg = messages[prev_assistant_idx]
-        while prev_assistant_idx >= 0 and assistant_msg.get("role") == "tool":
-            prev_assistant_idx -= 1
-            assistant_msg = messages[prev_assistant_idx]
-
-        assert (
-            index == 0
-            or prev_assistant_idx >= 0
-            and assistant_msg.get("role") == "assistant"
-        ), f"Invalid messages at {index}:\n{assistant_msg}"
-
-        tool_call_order = index - prev_assistant_idx
-        assistant_tool_calls = assistant_msg.get("tool_calls")
-        assert (
-            assistant_tool_calls and len(assistant_tool_calls) >= tool_call_order
-        ), "No tool calls but found tool output"
-
-        if tool_call_order == 1:
-            prompt += "\n\n<function_results>"
-
-        prompt += tool_output_template.format(content=content)
-
-        if tool_call_order == len(assistant_tool_calls):
-            prompt += "\n</function_results>"
-
-            if index >= last_user_idx and thinking_mode == "thinking":
-                prompt += "\n\n" + thinking_start_token
-            else:
-                prompt += "\n\n" + thinking_end_token
-
-    elif role == "assistant":
-        prev_assistant_idx = index
-        thinking_part = ""
-
-        tool_calls_content = ""
-        if tool_calls:
-            tool_calls = [
-                tool_call_template.format(
-                    dsml_token=dsml_token,
-                    name=tool_call.get("name"),
-                    arguments=encode_arguments_to_dsml(tool_call),
-                )
-                for tool_call in tool_calls
-            ]
-            tool_calls_content += "\n\n" + tool_calls_template.format(
-                dsml_token=dsml_token, tool_calls="\n".join(tool_calls)
-            )
-
-        summary_content = content or ""
-
-        if thinking_mode == "thinking" and index > last_user_idx:
-            assert (
-                reasoning_content or tool_calls
-            ), f"ThinkingMode: {thinking_mode}, invalid message without reasoning_content/tool_calls `{msg}` after last user message"
-            thinking_part = (
-                thinking_template.format(reasoning_content=reasoning_content or "")
-                + thinking_end_token
-            )
-
-        prompt += assistant_msg_template.format(
-            reasoning=thinking_part,
-            content=summary_content,
-            tool_calls=tool_calls_content,
-        )
-    else:
-        raise NotImplementedError(f"Unknown role: {role}")
-
-    return prompt
-
-
-def drop_thinking_messages(
-    messages: List[Dict[str, Any]], last_user_idx: Optional[int] = None
 ) -> List[Dict[str, Any]]:
-    messages_wo_thinking: List[Dict[str, Any]] = []
-    last_user_idx = (
-        find_last_user_index(messages) if last_user_idx is None else last_user_idx
-    )
-    for idx, msg in enumerate(messages):
-        role = msg.get("role")
-        if role in ["user", "system", "tool"] or idx >= last_user_idx:
-            messages_wo_thinking.append(msg)
+    """JSON-stringify dict-typed ``tool_call["function"]["arguments"]``.
+
+    The omlx Anthropic adapter (``api/anthropic_utils.py``) decodes
+    Claude's ``input`` field into a dict before storing it on assistant
+    messages. The shipped ``encode_arguments_to_dsml`` only knows the
+    OpenAI JSON-string convention and would otherwise fall back to
+    wrapping the entire dict under a single ``arguments`` parameter,
+    breaking multi-turn history. Normalize at the adapter boundary so
+    the vendored encoding module stays byte-identical to upstream.
+    """
+    normalized: List[Dict[str, Any]] = []
+    for msg in messages:
+        if msg.get("role") != "assistant" or not msg.get("tool_calls"):
+            normalized.append(msg)
             continue
+        new_calls = []
+        for tc in msg["tool_calls"]:
+            fn = tc.get("function") or {}
+            args = fn.get("arguments")
+            if isinstance(args, dict):
+                tc = {
+                    **tc,
+                    "function": {
+                        **fn,
+                        "arguments": json.dumps(args, ensure_ascii=False),
+                    },
+                }
+            new_calls.append(tc)
+        normalized.append({**msg, "tool_calls": new_calls})
+    return normalized
 
-        elif role == "assistant":
-            msg_wo_thinking = copy.copy(msg)
-            msg_wo_thinking.pop("reasoning_content", None)
-            messages_wo_thinking.append(msg_wo_thinking)
 
-    return messages_wo_thinking
-
-
-def encode_messages(
-    messages: List[Dict[str, Any]],
-    thinking_mode: str = "thinking",
-    context: Optional[List[Dict[str, Any]]] = None,
-    drop_thinking: bool = True,
-    add_default_bos_token: bool = True,
-    tools: Any = None,
-) -> str:
-    context = context if context else []
-
-    # render_message only injects the DSML tools block on system / developer
-    # roles (chat_template_v4.py:194-207). When the first message is a
-    # plain user (e.g. OpenAI request without a system message, or an
-    # Anthropic request whose system field was empty) the tools schema
-    # never reaches the model and it cannot emit a tool_calls block.
-    # Prepend an empty synthetic system message so render_tools fires
-    # without otherwise altering the conversation.
-    if (
-        tools
-        and messages
-        and messages[0].get("role") not in ("system", "developer")
-        and not (context and context[0].get("role") in ("system", "developer"))
-    ):
-        messages = [{"role": "system", "content": ""}, *messages]
-
-    full_messages = context + messages
-    prompt = bos_token if add_default_bos_token and len(context) == 0 else ""
-
-    if thinking_mode == "thinking" and drop_thinking:
-        full_messages = drop_thinking_messages(full_messages)
-
-    for idx in range(len(messages)):
-        prompt += render_message(
-            idx + len(context),
-            full_messages,
-            thinking_mode=thinking_mode,
-            tools=tools,
-        )
-
-    return prompt
+def _inject_top_level_tools(
+    messages: List[Dict[str, Any]], tools: Any
+) -> List[Dict[str, Any]]:
+    """Move a top-level ``tools`` kwarg onto the first system / developer
+    message (or synthesise one) so ``render_message`` emits the DSML
+    tools block. mlx-lm and the omlx server pass ``tools`` as a kwarg
+    to ``apply_chat_template``, but ``encoding_dsv4`` reads it off the
+    message.
+    """
+    if not tools:
+        return messages
+    if messages and messages[0].get("role") in ("system", "developer"):
+        if messages[0].get("tools"):
+            return messages
+        return [{**messages[0], "tools": tools}, *messages[1:]]
+    return [{"role": "system", "content": "", "tools": tools}, *messages]
 
 
 def apply_chat_template(
-    messages, continue_final_message=False, add_generation_prompt=False, **kwargs
-):
-    # mlx-lm and the omlx server forward an ``enable_thinking`` boolean
-    # kwarg through ``tokenizer.apply_chat_template``. The V3.2-derived
-    # ``encode_messages`` signature only knows ``thinking_mode`` ("chat"
-    # | "thinking"). Translate here so the caller's kwarg shape is
-    # preserved without leaking the rename downstream.
+    messages: List[Dict[str, Any]],
+    continue_final_message: bool = False,
+    add_generation_prompt: bool = False,
+    **kwargs: Any,
+) -> str:
+    """mlx-lm-facing entry point. Bridges ``apply_chat_template``'s
+    signature to ``encoding_dsv4.encode_messages`` and applies omlx
+    boundary fixes (dict-typed tool-call arguments, top-level ``tools``
+    kwarg) without modifying the vendored encoding module.
+    """
+    if continue_final_message and add_generation_prompt:
+        raise ValueError(
+            "Only one of continue_final_message or add_generation_prompt can be True"
+        )
+
     if "enable_thinking" in kwargs and "thinking_mode" not in kwargs:
         kwargs["thinking_mode"] = (
             "thinking" if kwargs.pop("enable_thinking") else "chat"
@@ -391,25 +157,43 @@ def apply_chat_template(
     else:
         kwargs.pop("enable_thinking", None)
 
-    # Drop unknown kwargs that some API frontends inject but
-    # encode_messages does not consume — keeps the wrapper resilient
-    # against future template_kwargs additions.
-    _accepted = {
-        "thinking_mode",
-        "context",
-        "drop_thinking",
-        "add_default_bos_token",
-        "tools",
-    }
-    kwargs = {k: v for k, v in kwargs.items() if k in _accepted}
+    messages = _normalize_tool_call_arguments(list(messages))
+    messages = _inject_top_level_tools(messages, kwargs.pop("tools", None))
 
-    out = encode_messages(messages, **kwargs)
-    if continue_final_message and add_generation_prompt:
-        raise ValueError(
-            "Only one of continue_final_message or add_generation_prompt can be True"
+    if (
+        continue_final_message
+        and messages
+        and messages[-1].get("role") == "assistant"
+    ):
+        messages = [*messages[:-1], {**messages[-1], "wo_eos": True}]
+
+    kwargs = {k: v for k, v in kwargs.items() if k in _ENCODE_ACCEPTED_KWARGS}
+    kwargs.setdefault("thinking_mode", "thinking")
+    # V4Cache is non-block-sliceable: SSD prefix-cache entries store atomic
+    # full-state snapshots keyed by the exact input-token sequence that
+    # produced them. drop_thinking=True re-renders prior assistant turns
+    # without their reasoning_content, so turn 2's encoded prompt drifts
+    # away from turn 1's cached state at the first reasoning token and
+    # never hits the prefix cache. Force False at the adapter so cross-
+    # turn cache reuse works. (Caller can still override by passing
+    # drop_thinking=True explicitly.)
+    kwargs.setdefault("drop_thinking", False)
+
+    out = _enc.encode_messages(messages, **kwargs)
+
+    # encoding_dsv4 unconditionally appends ``<｜Assistant｜><think>`` (or
+    # ``</think>``) after a trailing user/developer message. mlx-lm
+    # callers that pass ``add_generation_prompt=False`` (e.g. for SFT
+    # data preparation) want history without the assistant primer.
+    if not add_generation_prompt and messages and messages[-1].get("role") in (
+        "user",
+        "developer",
+    ):
+        out = out.removesuffix(
+            _enc.ASSISTANT_SP_TOKEN + _enc.thinking_start_token
         )
-    if not add_generation_prompt and messages[-1]["role"] == "user":
-        out = out.removesuffix("<｜Assistant｜><think>")
-    if continue_final_message and messages[-1]["role"] == "assistant":
-        out = out.removesuffix(eos_token)
+        out = out.removesuffix(
+            _enc.ASSISTANT_SP_TOKEN + _enc.thinking_end_token
+        )
+
     return out
