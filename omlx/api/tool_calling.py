@@ -1792,6 +1792,210 @@ class ToolCallStreamFilter:
         return buf
 
 
+class XmlStreamingToolCallEmitter:
+    """Incrementally re-emit Qwen/Llama-style XML tool calls as OpenAI
+    streaming ``tool_calls`` deltas.
+
+    Recognizes ``<tool_call><function=NAME><parameter=KEY>value</parameter>
+    ...</function></tool_call>`` and produces OpenAI-format ``tool_calls``
+    delta dicts so clients can render arguments live (shell commands, file
+    write contents, etc.) instead of seeing nothing until the envelope
+    closes.
+
+    Each ``feed`` call returns a list of partial chunk payloads:
+        ``{"index": i, "id": ..., "type": "function", "function": {"name": ...}}``
+        ``{"index": i, "function": {"arguments": "<partial JSON fragment>"}}``
+
+    Concatenating the ``function.arguments`` fragments for a given index
+    yields a complete JSON object whose keys/values match the XML body
+    (parameter values are always emitted as JSON strings, even when the
+    completed parser would have typed them as numbers/objects — type
+    fidelity is sacrificed for in-flight visibility).
+    """
+
+    _OPEN = "<tool_call>"
+    _CLOSE = "</tool_call>"
+    _FN_OPEN_RE = re.compile(r"<function=([A-Za-z_][\w.-]*)>")
+    _FN_CLOSE = "</function>"
+    _PARAM_OPEN_RE = re.compile(r"<parameter=([A-Za-z_][\w.-]*)>")
+    _PARAM_CLOSE = "</parameter>"
+    _MAX_DEFERRED_BUFFER = 256
+
+    def __init__(self) -> None:
+        self._buffer = ""
+        self._state = "outside"
+        self._call_index = -1
+        self._call_id: Optional[str] = None
+        self._fn_name: Optional[str] = None
+        self._first_param_in_call = True
+        self._value_started = False
+        self._pending_ws = ""
+
+    @property
+    def emitted_any(self) -> bool:
+        return self._call_index >= 0
+
+    def feed(self, text: str) -> List[dict]:
+        if not text:
+            return []
+        self._buffer += text
+        out: List[dict] = []
+        while True:
+            if self._state == "outside":
+                idx = self._buffer.find(self._OPEN)
+                if idx < 0:
+                    keep = _partial_suffix_prefix_len(self._buffer, self._OPEN)
+                    self._buffer = self._buffer[-keep:] if keep else ""
+                    break
+                self._buffer = self._buffer[idx + len(self._OPEN):]
+                self._state = "in_tool"
+
+            elif self._state == "in_tool":
+                m = self._FN_OPEN_RE.search(self._buffer)
+                close_idx = self._buffer.find(self._CLOSE)
+                if not m:
+                    # No <function=NAME> opener — likely a non-XML tool_call
+                    # envelope (JSON body, namespaced, etc.). Skip without
+                    # claiming we emitted anything; let other handlers parse.
+                    if close_idx >= 0:
+                        self._buffer = self._buffer[close_idx + len(self._CLOSE):]
+                        self._state = "outside"
+                        continue
+                    self._truncate_idle_buffer()
+                    break
+                # Confirmed XML format — commit to a new streamed call.
+                self._fn_name = m.group(1)
+                self._buffer = self._buffer[m.end():]
+                self._call_index += 1
+                self._call_id = f"call_{uuid.uuid4().hex[:8]}"
+                self._first_param_in_call = True
+                out.append({
+                    "index": self._call_index,
+                    "id": self._call_id,
+                    "type": "function",
+                    "function": {"name": self._fn_name, "arguments": "{"},
+                })
+                self._state = "in_function"
+
+            elif self._state == "in_function":
+                pm = self._PARAM_OPEN_RE.search(self._buffer)
+                fm = self._buffer.find(self._FN_CLOSE)
+                if pm and (fm < 0 or pm.start() < fm):
+                    key = pm.group(1)
+                    self._buffer = self._buffer[pm.end():]
+                    self._value_started = False
+                    self._pending_ws = ""
+                    sep = "" if self._first_param_in_call else ","
+                    self._first_param_in_call = False
+                    out.append({
+                        "index": self._call_index,
+                        "function": {
+                            "arguments": f'{sep}{json.dumps(key)}:"'
+                        },
+                    })
+                    self._state = "in_param"
+                    continue
+                if fm >= 0:
+                    self._buffer = self._buffer[fm + len(self._FN_CLOSE):]
+                    out.append({
+                        "index": self._call_index,
+                        "function": {"arguments": "}"},
+                    })
+                    self._state = "in_tool_after_func"
+                    continue
+                self._truncate_idle_buffer()
+                break
+
+            elif self._state == "in_param":
+                cidx = self._buffer.find(self._PARAM_CLOSE)
+                if cidx < 0:
+                    keep = _partial_suffix_prefix_len(self._buffer, self._PARAM_CLOSE)
+                    avail = self._buffer[: len(self._buffer) - keep] if keep else self._buffer
+                    self._buffer = self._buffer[-keep:] if keep else ""
+                    self._emit_value_chars(avail, out)
+                    break
+                avail = self._buffer[:cidx]
+                self._buffer = self._buffer[cidx + len(self._PARAM_CLOSE):]
+                self._emit_value_chars(avail, out)
+                # Discard any trailing whitespace pending inside the value.
+                self._pending_ws = ""
+                out.append({
+                    "index": self._call_index,
+                    "function": {"arguments": '"'},
+                })
+                self._state = "in_function"
+
+            elif self._state == "in_tool_after_func":
+                idx = self._buffer.find(self._CLOSE)
+                if idx < 0:
+                    self._truncate_idle_buffer()
+                    break
+                self._buffer = self._buffer[idx + len(self._CLOSE):]
+                self._state = "outside"
+
+            else:
+                break
+        return out
+
+    def finish(self) -> List[dict]:
+        """Flush partial state at end-of-stream by closing any open JSON tokens."""
+        out: List[dict] = []
+        if self._state == "in_param":
+            out.append({
+                "index": self._call_index,
+                "function": {"arguments": '"'},
+            })
+            self._state = "in_function"
+        if self._state == "in_function":
+            out.append({
+                "index": self._call_index,
+                "function": {"arguments": "}"},
+            })
+            self._state = "in_tool_after_func"
+        self._buffer = ""
+        return out
+
+    def _emit_value_chars(self, text: str, out: List[dict]) -> None:
+        if not text:
+            return
+        pieces: List[str] = []
+        for ch in text:
+            if not self._value_started:
+                if ch.isspace():
+                    continue
+                self._value_started = True
+            if ch.isspace():
+                self._pending_ws += ch
+                continue
+            if self._pending_ws:
+                pieces.append(_json_string_inner(self._pending_ws))
+                self._pending_ws = ""
+            pieces.append(_json_string_inner(ch))
+        if pieces:
+            out.append({
+                "index": self._call_index,
+                "function": {"arguments": "".join(pieces)},
+            })
+
+    def _truncate_idle_buffer(self) -> None:
+        if len(self._buffer) > self._MAX_DEFERRED_BUFFER:
+            self._buffer = self._buffer[-self._MAX_DEFERRED_BUFFER:]
+
+
+def _partial_suffix_prefix_len(text: str, marker: str) -> int:
+    max_len = min(len(text), len(marker) - 1)
+    for n in range(max_len, 0, -1):
+        if text.endswith(marker[:n]):
+            return n
+    return 0
+
+
+def _json_string_inner(s: str) -> str:
+    """JSON-encode s and strip the surrounding quotes, producing characters
+    safe to splice inside an open JSON string literal."""
+    return json.dumps(s, ensure_ascii=False)[1:-1]
+
+
 def convert_tools_for_template(tools: Optional[List]) -> Optional[List[dict]]:
     """
     Convert OpenAI tools format to format expected by tokenizer.apply_chat_template.

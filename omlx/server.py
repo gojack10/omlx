@@ -156,6 +156,7 @@ from .api.responses_utils import (
 from .api.thinking import ThinkingParser, extract_thinking, prompt_opens_thinking
 from .api.tool_calling import (
     ToolCallStreamFilter,
+    XmlStreamingToolCallEmitter,
     build_json_system_prompt,
     convert_tools_for_template,
     enrich_tool_params_for_gemma4,
@@ -4187,8 +4188,13 @@ async def stream_chat_completion(
     # Stream content token-by-token. When tools are present, a
     # ToolCallStreamFilter suppresses known tool-call control markup so
     # clients do not see raw envelopes/tags in assistant content deltas.
+    # An XmlStreamingToolCallEmitter runs in parallel to re-emit Qwen/Llama
+    # XML tool-call bodies as OpenAI streaming tool_calls deltas, so long
+    # arguments (file contents, shell commands) render live instead of
+    # appearing only after the envelope closes.
     tool_filter = None
     thinking_filter = None
+    xml_tc_emitter = XmlStreamingToolCallEmitter() if has_tools else None
     stream_content = True
     if has_tools:
         _content_filter = ToolCallStreamFilter(engine.tokenizer)
@@ -4231,6 +4237,19 @@ async def stream_chat_completion(
                 # Emit content delta — filter out tool-call markup when
                 # tools are present so clients see clean streamed text.
                 if content_delta:
+                    # Feed the RAW content delta (envelopes intact) so the
+                    # XML emitter can see <tool_call>/<function=> markers.
+                    if xml_tc_emitter is not None:
+                        for tc_payload in xml_tc_emitter.feed(content_delta):
+                            tc_chunk = ChatCompletionChunk(
+                                id=response_id,
+                                model=request.model,
+                                choices=[ChatCompletionChunkChoice(
+                                    delta=ChatCompletionChunkDelta(tool_calls=[tc_payload]),
+                                    finish_reason=None,
+                                )],
+                            )
+                            yield f"data: {tc_chunk.model_dump_json(exclude_none=True)}\n\n"
                     if tool_filter:
                         content_delta = tool_filter.feed(content_delta)
                     if content_delta:
@@ -4321,6 +4340,20 @@ async def stream_chat_completion(
                 )
                 yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
 
+    # Flush any unterminated XML tool-call envelope so the streamed
+    # arguments JSON ends in a parseable state.
+    if xml_tc_emitter is not None:
+        for tc_payload in xml_tc_emitter.finish():
+            tc_chunk = ChatCompletionChunk(
+                id=response_id,
+                model=request.model,
+                choices=[ChatCompletionChunkChoice(
+                    delta=ChatCompletionChunkDelta(tool_calls=[tc_payload]),
+                    finish_reason=None,
+                )],
+            )
+            yield f"data: {tc_chunk.model_dump_json(exclude_none=True)}\n\n"
+
     # Parse tool calls from accumulated text
     tool_calls = None
     cleaned_text = accumulated_text
@@ -4392,8 +4425,13 @@ async def stream_chat_completion(
                 except (json.JSONDecodeError, AttributeError):
                     pass
 
-    # Emit tool call chunks if found
-    if tool_calls:
+    # Emit tool call chunks if found — unless the XML streaming emitter
+    # already streamed them incrementally during generation, in which case
+    # re-emitting would duplicate the call on the client side (pi and other
+    # OpenAI-format consumers concatenate streamed function.arguments
+    # deltas rather than treating later chunks as overrides).
+    already_streamed_tool_calls = xml_tc_emitter is not None and xml_tc_emitter.emitted_any
+    if tool_calls and not already_streamed_tool_calls:
         for i, tc in enumerate(tool_calls):
             tc_chunk = ChatCompletionChunk(
                 id=response_id,
@@ -4418,11 +4456,11 @@ async def stream_chat_completion(
             )
             yield f"data: {tc_chunk.model_dump_json(exclude_none=True)}\n\n"
 
-    # Final chunk with finish_reason
-    finish_reason = (
-        "tool_calls"
-        if tool_calls
-        else (last_output.finish_reason if last_output else "stop")
+    # Final chunk with finish_reason — also respect streamed XML tool calls
+    # so the client sees the correct stop reason even when we suppressed
+    # the final tool_calls re-emission above.
+    finish_reason = "tool_calls" if (tool_calls or already_streamed_tool_calls) else (
+        last_output.finish_reason if last_output else "stop"
     )
     final_chunk = ChatCompletionChunk(
         id=response_id,
