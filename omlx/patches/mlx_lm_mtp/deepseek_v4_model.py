@@ -55,9 +55,23 @@ def apply() -> bool:
         return False
 
     _patch_model_args(dsv4)
-    _register_mtp_block(dsv4)
-    _patch_deepseek_v4_model_call(dsv4)
-    _patch_model(dsv4)
+
+    # The local JANGTQ deepseek_v4 module uses a different architecture:
+    # - No ``DeepseekV4Model`` wrapper (Model has layers directly)
+    # - Uses ``DeepseekV4DecoderLayer`` instead of ``DeepseekV4Block``
+    # - Has its own ``MTPBlock`` already defined
+    # - Uses ``self.head`` / ``self.embed`` instead of ``self.lm_head`` / ``self.model``
+    # The MTP patches for __call__/__init__/DeepseekV4Model are incompatible.
+    # Skip them — the JANGTQ model doesn't use MTP (drop_mtp=true).
+    if hasattr(dsv4, "DeepseekV4Model"):
+        _register_mtp_block(dsv4)
+        _patch_deepseek_v4_model_call(dsv4)
+        _patch_model(dsv4)
+    else:
+        logger.debug(
+            "JANGTQ architecture detected (no DeepseekV4Model) — skipping "
+            "MTP __call__/__init__ patches (incompatible with JANGTQ layout)"
+        )
 
     if not hasattr(dsv4.Model, "_omlx_mtp_patched"):
         dsv4.Model._omlx_mtp_patched = "patch"
@@ -238,6 +252,22 @@ def _patch_deepseek_v4_model_call(dsv4: Any) -> None:
 # replace sanitize with the PR 15 body that handles MTP weight remapping.
 # ---------------------------------------------------------------------------
 
+def _is_jangtq_checkpoint(weights: Dict[str, Any]) -> bool:
+    """Detect JANGTQ (MXTQ) quantized checkpoint by key patterns.
+
+    JANGTQ checkpoints contain ``tq_packed`` / ``tq_norms`` tensors for
+    routed experts and ``codebook.*`` / ``signs.*`` sidecar keys that
+    are unique to the JANGTQ 2-bit MXTQ format.  Stock DeepSeek-V4
+    checkpoints use FP4 / uint8 expert weights with ``.scale`` keys.
+    """
+    for k in weights:
+        if ".tq_packed" in k or ".tq_norms" in k:
+            return True
+        if k.startswith("codebook.") or k.startswith("signs."):
+            return True
+    return False
+
+
 def _patch_model(dsv4: Any) -> None:
     cls = dsv4.Model
     init_wrapped = getattr(cls, "_omlx_mtp_init_wrapped", False)
@@ -247,6 +277,11 @@ def _patch_model(dsv4: Any) -> None:
 
     import mlx.core as mx
     from mlx_lm.models.base import create_attention_mask
+
+    # Save the original sanitize (JANGTQ-aware) before we replace it.
+    # JANGTQ checkpoints need their own sanitize to load sidecar
+    # (codebook/signs), stack tq_* across experts, and dequant wo_a.
+    _original_sanitize = cls.sanitize
 
     # oMLX's DeepSeek-V4 fork uses a ``CacheList`` of (RotatingKVCache,
     # PoolingCache, [PoolingCache]) instead of upstream's
@@ -369,14 +404,19 @@ def _patch_model(dsv4: Any) -> None:
         return self.lm_head(out)
 
     def sanitize(self, weights: Dict[str, Any]) -> Dict[str, Any]:
-        """Combined oMLX-base + PR 15 sanitize.
+        """Combined oMLX-base + PR 15 sanitize (JANGTQ-aware).
 
-        oMLX's stock sanitize strips ``mtp.*`` and remaps the FP4 expert
-        weights / Hyper-head names. PR 15 keeps ``mtp.*`` when an MTP head
-        is present, nests block-internal weights under ``.block.``, and
-        stacks routed expert weights for MTP layers as well as backbone
-        layers.
+        For JANGTQ (MXTQ 2-bit) checkpoints, delegates to the original
+        ``Model.sanitize`` which handles sidecar loading, expert stacking,
+        and wo_a dequant.  For stock DeepSeek-V4 checkpoints, applies the
+        PR 15 sanitization (FP4 dequant, key remapping, expert stacking).
         """
+        # JANGTQ path: the original sanitize loads sidecar, stacks tq_*
+        # experts, and dequant wo_a.  PR 15 sanitize would lose these.
+        if _is_jangtq_checkpoint(weights):
+            logger.debug("JANGTQ checkpoint detected — using original sanitize")
+            return _original_sanitize(self, weights)
+
         n_layers = self.args.num_hidden_layers
         has_mtp = hasattr(self, "mtp")
         has_mtp_weights = any(k.startswith("mtp.") for k in weights)
