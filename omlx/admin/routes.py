@@ -661,15 +661,35 @@ def _model_has_mtp_weight_tensors(model_dir) -> bool:
 
     model_dir = Path(model_dir)
 
+    def _sidecar_has_mtp() -> bool:
+        try:
+            from ..patches.mtplx_sidecar import get_mtplx_mtp_sidecar
+
+            sidecar = get_mtplx_mtp_sidecar(model_dir)
+        except Exception:
+            sidecar = None
+        if sidecar is None:
+            return False
+        try:
+            with safe_open(str(sidecar), framework="numpy") as f:  # type: ignore[arg-type]
+                return any("mtp." in key for key in f.keys())
+        except Exception:
+            return False
+
     # Preferred path: read the index file's weight_map (no tensor data loaded).
     index_path = model_dir / "model.safetensors.index.json"
     if index_path.exists():
         try:
             index = json.loads(index_path.read_text())
             weight_map = index.get("weight_map", {})
-            return any("mtp." in key for key in weight_map.keys())
+            if any("mtp." in key for key in weight_map.keys()):
+                return True
+            return _sidecar_has_mtp()
         except Exception:
-            return False
+            return _sidecar_has_mtp()
+
+    if _sidecar_has_mtp():
+        return True
 
     # Single-shard fallback: enumerate keys via safe_open metadata. We
     # short-circuit on the first ``mtp.*`` key.
