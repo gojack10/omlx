@@ -119,6 +119,32 @@ class TestGemma4OutputParserSession:
         assert "<|channel>thought" not in text
         assert "<channel|>" not in text
 
+    def test_suppresses_eos_and_bos_markers(self):
+        """The EOS/BOS tokens decode to literal ``<eos>``/``<bos>`` text via the
+        Gemma 4 detokenizer. The BatchGenerator already treats EOS as a stop
+        signal, but the parser still processes the stop token, so the literal
+        text must be silently dropped to keep it out of visible output."""
+        token_map = {
+            1: "answer",
+            2: "<eos>",
+            3: "<bos>",
+            4: "<|turn>",
+        }
+        tokenizer = GemmaTokenizer(token_map)
+        session = Gemma4OutputParserSession(tokenizer)
+
+        parts = []
+        for token_id in [1, 2, 3, 4]:
+            result = session.process_token(token_id)
+            parts.append(result.stream_text)
+            assert "<eos>" not in result.visible_text
+            assert "<bos>" not in result.visible_text
+            assert "<|turn>" not in result.visible_text
+        parts.append(session.finalize().stream_text)
+
+        text = "".join(parts)
+        assert text == "answer"
+
     def test_suppresses_turn_end_marker(self):
         token_map = {
             1: "<|channel>thought\n",

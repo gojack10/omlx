@@ -19,8 +19,11 @@ _OPEN_MARKER = "<|channel>thought\n"
 _OPEN_MARKER_BARE = "<|channel>"
 _CLOSE_MARKER = "<channel|>"
 _TURN_END_MARKER = "<turn|>"
+_TURN_START_MARKER = "<|turn>"
 _TOOL_RESPONSE_OPEN = "<|tool_response>"
 _TOOL_RESPONSE_CLOSE = "<tool_response|>"
+_EOS_MARKER = "<eos>"
+_BOS_MARKER = "<bos>"
 _THINK_OPEN = "<think>\n"
 _THINK_CLOSE = "</think>\n"
 
@@ -328,8 +331,11 @@ class Gemma4OutputParserSession:
             _OPEN_MARKER_BARE,
             _CLOSE_MARKER,
             _TURN_END_MARKER,
+            _TURN_START_MARKER,
             _TOOL_RESPONSE_OPEN,
             _TOOL_RESPONSE_CLOSE,
+            _EOS_MARKER,
+            _BOS_MARKER,
         ]
 
     @staticmethod
