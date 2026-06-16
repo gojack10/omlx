@@ -97,6 +97,8 @@ def _record_audio_request(model_id: str) -> None:
             completion_tokens=0,
             cached_tokens=0,
             model_id=model_id,
+            endpoint="audio",
+            stream=False,
         )
     except Exception as exc:
         logger.warning("Failed to record audio metrics for %s: %s", model_id, exc)

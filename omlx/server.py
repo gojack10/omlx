@@ -2517,6 +2517,9 @@ async def create_embeddings(
             cached_tokens=0,
             prefill_duration=elapsed,
             model_id=resolve_model_id(request.model) or request.model,
+            endpoint="embeddings",
+            api="openai",
+            stream=False,
         )
 
         data = []
@@ -2641,6 +2644,8 @@ async def create_rerank(
         cached_tokens=0,
         prefill_duration=elapsed,
         model_id=resolve_model_id(request.model) or request.model,
+        endpoint="rerank",
+        stream=False,
     )
 
     # Format response - results sorted by score (descending). Strings wrap
@@ -2797,6 +2802,9 @@ async def create_completion(
             cached_tokens=total_cached_tokens,
             generation_duration=elapsed,
             model_id=resolve_model_id(request.model) or request.model,
+            endpoint="completions",
+            api="openai",
+            stream=False,
         )
 
         return CompletionResponse(
@@ -3233,6 +3241,10 @@ async def create_chat_completion(
             prefill_duration=metric_prefill_duration,
             generation_duration=metric_gen_duration,
             model_id=resolved_model,
+            endpoint="chat.completions",
+            api="openai",
+            stream=False,
+            finish_reason=output.finish_reason or "",
         )
 
         # Separate thinking from content
@@ -3829,6 +3841,10 @@ async def stream_completion(
             prefill_duration=metric_prefill_duration,
             generation_duration=metric_gen_duration,
             model_id=resolve_model_id(request.model) or request.model,
+            endpoint="completions",
+            api="openai",
+            stream=True,
+            finish_reason=last_output.finish_reason or "",
         )
         speed_duration = total_duration if is_diffusion else gen_duration
         tokens_per_sec = (
@@ -4239,6 +4255,10 @@ async def stream_chat_completion(
             prefill_duration=metric_prefill_duration,
             generation_duration=metric_gen_duration,
             model_id=resolved_model or request.model,
+            endpoint="chat.completions",
+            api="openai",
+            stream=True,
+            finish_reason=last_output.finish_reason or "",
         )
         speed_duration = total_duration if is_diffusion else gen_duration
         tokens_per_sec = (
@@ -4642,6 +4662,10 @@ async def stream_anthropic_messages(
             prefill_duration=ttft,
             generation_duration=gen_duration,
             model_id=resolved_model or request.model,
+            endpoint="messages",
+            api="anthropic",
+            stream=True,
+            finish_reason=last_output.finish_reason or "",
         )
 
     # 7. Send message_stop
@@ -4948,6 +4972,10 @@ async def create_anthropic_message(
             cached_tokens=output.cached_tokens,
             generation_duration=elapsed,
             model_id=resolved_model,
+            endpoint="messages",
+            api="anthropic",
+            stream=False,
+            finish_reason=getattr(output, "finish_reason", "") or "",
         )
 
         # Separate thinking from content
@@ -5407,6 +5435,10 @@ async def create_response(
             cached_tokens=output.cached_tokens,
             generation_duration=elapsed,
             model_id=resolved_model,
+            endpoint="responses",
+            api="openai-responses",
+            stream=False,
+            finish_reason=getattr(output, "finish_reason", "") or "",
         )
 
         # Process output text
@@ -6089,6 +6121,10 @@ async def stream_responses_api(
             prefill_duration=ttft,
             generation_duration=gen_duration,
             model_id=resolved_model or request.model,
+            endpoint="responses",
+            api="openai-responses",
+            stream=True,
+            finish_reason=last_output.finish_reason or "",
         )
         reasoning_token_count = (
             len(engine.tokenizer.encode(accumulated_reasoning))

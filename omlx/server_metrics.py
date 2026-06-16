@@ -7,6 +7,7 @@ across all engines/models. Session metrics reset on server start,
 while all-time metrics persist across restarts via JSON file.
 """
 
+import datetime
 import json
 import logging
 import threading
@@ -36,11 +37,13 @@ class ServerMetrics:
     def __init__(self, stats_path: Optional[Path] = None):
         self._lock = threading.Lock()
         self._stats_path = stats_path
+        self._usage_path = stats_path.with_name("usage.jsonl") if stats_path else None
 
         # Session totals (reset on server restart or clear)
         self.total_prompt_tokens: int = 0
         self.total_completion_tokens: int = 0
         self.total_cached_tokens: int = 0
+        self.total_cache_write_tokens: int = 0
         self.total_requests: int = 0
         self.total_prefill_duration: float = 0.0
         self.total_generation_duration: float = 0.0
@@ -61,6 +64,7 @@ class ServerMetrics:
         self._alltime_prompt_tokens: int = 0
         self._alltime_completion_tokens: int = 0
         self._alltime_cached_tokens: int = 0
+        self._alltime_cache_write_tokens: int = 0
         self._alltime_requests: int = 0
         self._alltime_prefill_duration: float = 0.0
         self._alltime_generation_duration: float = 0.0
@@ -79,6 +83,7 @@ class ServerMetrics:
             "prompt_tokens": 0,
             "completion_tokens": 0,
             "cached_tokens": 0,
+            "cache_write_tokens": 0,
             "requests": 0,
             "prefill_duration": 0.0,
             "generation_duration": 0.0,
@@ -96,6 +101,12 @@ class ServerMetrics:
                 data.get("total_completion_tokens", 0)
             )
             self._alltime_cached_tokens = int(data.get("total_cached_tokens", 0))
+            self._alltime_cache_write_tokens = int(
+                data.get(
+                    "total_cache_write_tokens",
+                    max(0, self._alltime_prompt_tokens - self._alltime_cached_tokens),
+                )
+            )
             self._alltime_requests = int(data.get("total_requests", 0))
             self._alltime_prefill_duration = float(
                 data.get("total_prefill_duration", 0.0)
@@ -109,6 +120,16 @@ class ServerMetrics:
                     "prompt_tokens": int(counters.get("prompt_tokens", 0)),
                     "completion_tokens": int(counters.get("completion_tokens", 0)),
                     "cached_tokens": int(counters.get("cached_tokens", 0)),
+                    "cache_write_tokens": int(
+                        counters.get(
+                            "cache_write_tokens",
+                            max(
+                                0,
+                                int(counters.get("prompt_tokens", 0))
+                                - int(counters.get("cached_tokens", 0)),
+                            ),
+                        )
+                    ),
                     "requests": int(counters.get("requests", 0)),
                     "prefill_duration": float(counters.get("prefill_duration", 0.0)),
                     "generation_duration": float(
@@ -128,6 +149,7 @@ class ServerMetrics:
                 "total_prompt_tokens": self._alltime_prompt_tokens,
                 "total_completion_tokens": self._alltime_completion_tokens,
                 "total_cached_tokens": self._alltime_cached_tokens,
+                "total_cache_write_tokens": self._alltime_cache_write_tokens,
                 "total_requests": self._alltime_requests,
                 "total_prefill_duration": self._alltime_prefill_duration,
                 "total_generation_duration": self._alltime_generation_duration,
@@ -164,13 +186,35 @@ class ServerMetrics:
         prefill_duration: float = 0.0,
         generation_duration: float = 0.0,
         model_id: str = "",
+        endpoint: str = "",
+        api: str = "",
+        stream: Optional[bool] = None,
+        finish_reason: str = "",
     ) -> None:
         """Record a completed request. Thread-safe."""
+        cache_write_tokens = max(0, int(prompt_tokens) - int(cached_tokens))
+        timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+        event = {
+            "timestamp": timestamp,
+            "server": "omlx",
+            "endpoint": endpoint,
+            "api": api,
+            "model": model_id,
+            "prompt_tokens": int(prompt_tokens),
+            "completion_tokens": int(completion_tokens),
+            "cached_tokens": int(cached_tokens),
+            "cache_write_tokens": cache_write_tokens,
+            "prefill_duration": float(prefill_duration),
+            "generation_duration": float(generation_duration),
+            "stream": stream,
+            "finish_reason": finish_reason,
+        }
         with self._lock:
             # Session counters
             self.total_prompt_tokens += prompt_tokens
             self.total_completion_tokens += completion_tokens
             self.total_cached_tokens += cached_tokens
+            self.total_cache_write_tokens += cache_write_tokens
             self.total_requests += 1
             self.total_prefill_duration += prefill_duration
             self.total_generation_duration += generation_duration
@@ -179,6 +223,7 @@ class ServerMetrics:
             self._alltime_prompt_tokens += prompt_tokens
             self._alltime_completion_tokens += completion_tokens
             self._alltime_cached_tokens += cached_tokens
+            self._alltime_cache_write_tokens += cache_write_tokens
             self._alltime_requests += 1
             self._alltime_prefill_duration += prefill_duration
             self._alltime_generation_duration += generation_duration
@@ -191,6 +236,7 @@ class ServerMetrics:
                 m["prompt_tokens"] += prompt_tokens
                 m["completion_tokens"] += completion_tokens
                 m["cached_tokens"] += cached_tokens
+                m["cache_write_tokens"] += cache_write_tokens
                 m["requests"] += 1
                 m["prefill_duration"] += prefill_duration
                 m["generation_duration"] += generation_duration
@@ -202,12 +248,27 @@ class ServerMetrics:
                 am["prompt_tokens"] += prompt_tokens
                 am["completion_tokens"] += completion_tokens
                 am["cached_tokens"] += cached_tokens
+                am["cache_write_tokens"] += cache_write_tokens
                 am["requests"] += 1
                 am["prefill_duration"] += prefill_duration
                 am["generation_duration"] += generation_duration
 
             # Periodic save
             self._maybe_save_alltime()
+
+        self._append_usage_event(event)
+
+    def _append_usage_event(self, event: Dict[str, Any]) -> None:
+        """Append one request event for time-series observability."""
+        if not self._usage_path:
+            return
+        try:
+            self._usage_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._usage_path, "a") as f:
+                json.dump(event, f, separators=(",", ":"))
+                f.write("\n")
+        except OSError as e:
+            logger.warning("Failed to append usage event to %s: %s", self._usage_path, e)
 
     def record_preflight_rejection(self, reason: str) -> None:
         """Increment the preflight-rejection counter for ``reason``.
@@ -321,6 +382,7 @@ class ServerMetrics:
             self.total_prompt_tokens = 0
             self.total_completion_tokens = 0
             self.total_cached_tokens = 0
+            self.total_cache_write_tokens = 0
             self.total_requests = 0
             self.total_prefill_duration = 0.0
             self.total_generation_duration = 0.0
@@ -332,17 +394,17 @@ class ServerMetrics:
             self._alltime_prompt_tokens = 0
             self._alltime_completion_tokens = 0
             self._alltime_cached_tokens = 0
+            self._alltime_cache_write_tokens = 0
             self._alltime_requests = 0
             self._alltime_prefill_duration = 0.0
             self._alltime_generation_duration = 0.0
             self._alltime_per_model.clear()
-        if self._stats_path and self._stats_path.exists():
-            try:
-                self._stats_path.unlink()
-            except OSError as e:
-                logger.warning(
-                    "Failed to delete stats file %s: %s", self._stats_path, e
-                )
+        for path in (self._stats_path, self._usage_path):
+            if path and path.exists():
+                try:
+                    path.unlink()
+                except OSError as e:
+                    logger.warning("Failed to delete metrics file %s: %s", path, e)
 
 
 # Global singleton
